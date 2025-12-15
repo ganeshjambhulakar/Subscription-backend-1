@@ -1,0 +1,635 @@
+const { ethers } = require('ethers');
+const { Pool } = require('pg');
+const crypto = require('crypto');
+const checkoutContract = require('../helpers/contract');
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+});
+
+/**
+ * Generate unique order ID
+ */
+function generateOrderId() {
+  return `ORD-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
+}
+
+/**
+ * Generate API key and secret
+ */
+function generateApiKey() {
+  const apiKey = `ck_${crypto.randomBytes(24).toString('hex')}`;
+  const apiSecret = crypto.randomBytes(32).toString('hex');
+  return { apiKey, apiSecret };
+}
+
+/**
+ * Create a new checkout order
+ */
+async function createOrder(orderData) {
+  const {
+    vendorAddress,
+    customerAddress,
+    items,
+    totalAmount,
+    totalAmountInINR, // Store INR equivalent for crypto payments
+    currency = 'ETH',
+    network = 'localhost',
+    metadata = {}
+  } = orderData;
+
+  // Customers can create multiple orders for the same product - no restrictions
+  // Generate unique order ID
+  const orderId = generateOrderId();
+  const client = await pool.connect();
+
+  try {
+    // Use transaction for data consistency
+    await client.query('BEGIN');
+
+    // Store INR amount in metadata if provided
+    const enhancedMetadata = {
+      ...metadata,
+      ...(totalAmountInINR && { totalAmountInINR })
+    };
+
+    // Create order
+    const orderResult = await client.query(
+      `INSERT INTO checkout_orders 
+       (order_id, vendor_address, customer_address, total_amount, currency, network, metadata, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING *`,
+      [
+        orderId,
+        vendorAddress.toLowerCase(),
+        customerAddress ? customerAddress.toLowerCase() : null,
+        totalAmount,
+        currency,
+        network,
+        JSON.stringify(enhancedMetadata),
+        new Date(Date.now() + 30 * 60 * 1000) // 30 minutes expiry
+      ]
+    );
+
+    // Create order items
+    if (items && items.length > 0) {
+      for (const item of items) {
+        await client.query(
+          `INSERT INTO checkout_order_items 
+           (order_id, product_id, product_name, product_description, quantity, unit_price, total_price, metadata)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [
+            orderId,
+            item.productId || null,
+            item.name,
+            item.description || null,
+            item.quantity || 1,
+            item.unitPrice,
+            item.totalPrice || (item.unitPrice * (item.quantity || 1)),
+            item.metadata ? JSON.stringify(item.metadata) : null
+          ]
+        );
+      }
+    }
+
+    await client.query('COMMIT');
+
+    // Create order on blockchain
+    let blockchainOrderId = null;
+    let blockchainTxHash = null;
+    try {
+      const contract = await checkoutContract.getContract(network);
+      const orderIdBytes = ethers.id(orderId);
+      const expiresAt = Math.floor((Date.now() + 30 * 60 * 1000) / 1000);
+      const amountWei = ethers.parseEther(totalAmount.toString());
+      
+      // Get contract owner (deployer) - in production, use a relayer or owner account
+      // For now, we'll try to call it. If it fails, order still exists in DB
+      try {
+        // Check if order already exists on blockchain
+        const exists = await contract.orderExists(orderIdBytes);
+        if (exists) {
+          console.log(`[Checkout] Order ${orderId} already exists on blockchain`);
+        } else {
+          // Try to create order (requires owner)
+          // Note: In production, use a relayer or owner account stored securely
+          const ownerPrivateKey = process.env.CHECKOUT_CONTRACT_OWNER_PRIVATE_KEY;
+          if (ownerPrivateKey) {
+            const { ethers } = require('ethers');
+            const rpcUrl = checkoutContract.getRpcUrlForNetwork(network);
+            const provider = new ethers.JsonRpcProvider(rpcUrl);
+            const wallet = new ethers.Wallet(ownerPrivateKey, provider);
+            
+            const config = checkoutContract.loadCheckoutConfig(network);
+            const abi = checkoutContract.loadContractABI();
+            const contractWithSigner = new ethers.Contract(config.contractAddress, abi, wallet);
+            
+            const tx = await contractWithSigner.createOrder(
+              orderIdBytes,
+              vendorAddress,
+              amountWei,
+              expiresAt
+            );
+            const receipt = await tx.wait();
+            blockchainTxHash = receipt.hash;
+            blockchainOrderId = orderIdBytes;
+            console.log(`[Checkout] ✅ Order ${orderId} created on blockchain: ${receipt.hash}`);
+          } else {
+            console.log(`[Checkout] ⚠️  CHECKOUT_CONTRACT_OWNER_PRIVATE_KEY not set. Order created in DB only. Set owner private key to enable blockchain creation.`);
+          }
+        }
+      } catch (error) {
+        console.warn(`[Checkout] ⚠️  Failed to create order on blockchain:`, error.message);
+        // Continue - order exists in DB
+      }
+    } catch (error) {
+      console.warn(`[Checkout] ⚠️  Checkout contract not available:`, error.message);
+      // Continue even if blockchain creation fails - order exists in DB
+    }
+
+    const order = orderResult.rows[0];
+    if (blockchainTxHash) {
+      order.blockchain_tx_hash = blockchainTxHash;
+      order.blockchain_order_id = blockchainOrderId;
+    }
+
+    // Trigger order.created webhook (AC2.1)
+    try {
+      // Get API key ID from vendor address
+      const apiKeyResult = await pool.query(
+        `SELECT id FROM vendor_api_keys WHERE vendor_address = $1 AND active = true LIMIT 1`,
+        [vendorAddress.toLowerCase()]
+      );
+
+      if (apiKeyResult.rows.length > 0) {
+        await sendWebhook({
+          vendorAddress,
+          apiKeyId: apiKeyResult.rows[0].id,
+          orderId,
+          eventType: 'order.created',
+          payload: {
+            orderId,
+            vendorAddress: vendorAddress.toLowerCase(),
+            customerAddress: customerAddress ? customerAddress.toLowerCase() : null,
+            items: items,
+            totalAmount: totalAmount,
+            currency: currency,
+            network: network,
+            status: 'pending',
+            createdAt: new Date().toISOString(),
+            expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
+            metadata: enhancedMetadata
+          }
+        });
+      }
+    } catch (webhookError) {
+      console.warn('[Checkout] Error triggering order.created webhook:', webhookError.message);
+    }
+
+    return order;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Get order by ID (with blockchain status sync - blockchain is source of truth)
+ */
+async function getOrder(orderId, network = 'localhost') {
+  const orderResult = await pool.query(
+    `SELECT * FROM checkout_orders WHERE order_id = $1`,
+    [orderId]
+  );
+
+  if (orderResult.rows.length === 0) {
+    return null;
+  }
+
+  const order = orderResult.rows[0];
+
+  // Get order items
+  const itemsResult = await pool.query(
+    `SELECT * FROM checkout_order_items WHERE order_id = $1`,
+    [orderId]
+  );
+
+  order.items = itemsResult.rows;
+
+  // Get transaction if exists
+  const txResult = await pool.query(
+    `SELECT * FROM checkout_transactions WHERE order_id = $1 ORDER BY created_at DESC LIMIT 1`,
+    [orderId]
+  );
+
+  if (txResult.rows.length > 0) {
+    order.transaction = txResult.rows[0];
+  }
+
+  // CRITICAL: Sync status from blockchain (blockchain is source of truth)
+  if (order.blockchain_order_id || order.blockchain_tx_hash || order.network === network) {
+    try {
+      const contract = await checkoutContract.getContract(network);
+      const orderIdBytes = ethers.id(orderId);
+      const exists = await contract.orderExists(orderIdBytes);
+      
+      if (exists) {
+        const blockchainOrder = await contract.getOrder(orderIdBytes);
+        // Map blockchain status enum to database status
+        const statusMap = ['pending', 'paid', 'confirmed', 'received', 'cancelled', 'refunded'];
+        const blockchainStatus = statusMap[blockchainOrder.status] || order.status;
+        
+        // Update database if status differs (blockchain is source of truth)
+        if (blockchainStatus !== order.status) {
+          console.log(`[Checkout] 🔄 Syncing order ${orderId} status from blockchain: ${order.status} → ${blockchainStatus}`);
+          await updateOrderStatus(orderId, blockchainStatus);
+          order.status = blockchainStatus;
+        }
+      }
+    } catch (error) {
+      console.warn(`[Checkout] ⚠️ Could not sync blockchain status for order ${orderId}:`, error.message);
+      // Continue with DB status if blockchain sync fails
+    }
+  }
+
+  return order;
+}
+
+/**
+ * Get all orders (for customer page - shows all orders)
+ */
+async function getAllOrders(network = 'localhost') {
+  const result = await pool.query(
+    `SELECT 
+      co.*,
+      COALESCE(
+        json_agg(
+          json_build_object(
+            'id', coi.id,
+            'name', coi.product_name,
+            'item_name', coi.product_name,
+            'product_name', coi.product_name,
+            'unit_price', coi.unit_price,
+            'quantity', coi.quantity,
+            'total_price', coi.total_price
+          )
+        ) FILTER (WHERE coi.id IS NOT NULL),
+        '[]'::json
+      ) as items
+    FROM checkout_orders co
+    LEFT JOIN checkout_order_items coi ON co.order_id = coi.order_id
+    WHERE co.network = $1
+    GROUP BY co.id
+    ORDER BY co.created_at DESC`,
+    [network]
+  );
+
+  // Sync status from blockchain for orders that exist on-chain
+  for (const order of result.rows) {
+    if (order.blockchain_order_id || order.blockchain_tx_hash) {
+      try {
+        const contract = await checkoutContract.getContract(network);
+        const orderIdBytes = ethers.id(order.order_id);
+        const exists = await contract.orderExists(orderIdBytes);
+        
+        if (exists) {
+          const blockchainOrder = await contract.getOrder(orderIdBytes);
+          // Map blockchain status enum to database status
+          const statusMap = ['pending', 'paid', 'confirmed', 'received', 'cancelled', 'refunded'];
+          const blockchainStatus = statusMap[blockchainOrder.status] || order.status;
+          
+          // Update database if status differs
+          if (blockchainStatus !== order.status) {
+            console.log(`[Checkout] 🔄 Syncing order ${order.order_id} status: ${order.status} → ${blockchainStatus}`);
+            await updateOrderStatus(order.order_id, blockchainStatus);
+            order.status = blockchainStatus;
+          }
+        }
+      } catch (error) {
+        console.warn(`[Checkout] ⚠️ Could not sync blockchain status for order ${order.order_id}:`, error.message);
+      }
+    }
+  }
+
+  return result.rows;
+}
+
+/**
+ * Get orders by customer address
+ */
+async function getCustomerOrders(customerAddress, network = 'localhost') {
+  // Return all orders for customer page (not filtered by customer address)
+  return await getAllOrders(network);
+}
+
+/**
+ * Get orders by vendor address
+ */
+async function getVendorOrders(vendorAddress, network = 'localhost') {
+  // Return all orders for vendor page (not filtered by vendor address)
+  return await getAllOrders(network);
+}
+
+/**
+ * Update order status
+ */
+async function updateOrderStatus(orderId, status, transactionHash = null) {
+  // Get previous status for webhook
+  const previousOrder = await pool.query(
+    `SELECT status, vendor_address FROM checkout_orders WHERE order_id = $1`,
+    [orderId]
+  );
+  const previousStatus = previousOrder.rows[0]?.status;
+  const vendorAddress = previousOrder.rows[0]?.vendor_address;
+
+  const updates = ['status = $1', 'updated_at = CURRENT_TIMESTAMP'];
+  const values = [status, orderId];
+
+  if (transactionHash) {
+    updates.push('transaction_hash = $3');
+    values.push(transactionHash);
+  }
+
+  const result = await pool.query(
+    `UPDATE checkout_orders 
+     SET ${updates.join(', ')}
+     WHERE order_id = $2
+     RETURNING *`,
+    values
+  );
+
+  // Trigger order.status_changed webhook if status actually changed (AC2.4)
+  if (result.rows[0] && previousStatus && previousStatus !== status && vendorAddress) {
+    try {
+      const apiKeyResult = await pool.query(
+        `SELECT id FROM vendor_api_keys WHERE vendor_address = $1 AND active = true LIMIT 1`,
+        [vendorAddress.toLowerCase()]
+      );
+
+      if (apiKeyResult.rows.length > 0) {
+        await sendWebhook({
+          vendorAddress,
+          apiKeyId: apiKeyResult.rows[0].id,
+          orderId,
+          eventType: 'order.status_changed',
+          payload: {
+            orderId,
+            previousStatus: previousStatus,
+            newStatus: status,
+            transactionHash: transactionHash || null,
+            updatedAt: new Date().toISOString()
+          }
+        });
+      }
+    } catch (webhookError) {
+      console.warn('[Checkout] Error triggering order.status_changed webhook:', webhookError.message);
+    }
+  }
+
+  return result.rows[0];
+}
+
+/**
+ * Record transaction
+ */
+async function recordTransaction(txData) {
+  const {
+    orderId,
+    transactionHash,
+    fromAddress,
+    toAddress,
+    amount,
+    gasUsed,
+    gasPrice,
+    blockNumber,
+    network = 'localhost',
+    status = 'pending'
+  } = txData;
+
+  const result = await pool.query(
+    `INSERT INTO checkout_transactions 
+     (order_id, transaction_hash, from_address, to_address, amount, gas_used, gas_price, block_number, network, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT (transaction_hash) DO UPDATE SET
+       status = EXCLUDED.status,
+       block_number = EXCLUDED.block_number,
+       updated_at = CURRENT_TIMESTAMP
+     RETURNING *`,
+    [
+      orderId,
+      transactionHash,
+      fromAddress.toLowerCase(),
+      toAddress.toLowerCase(),
+      amount,
+      gasUsed,
+      gasPrice,
+      blockNumber,
+      network,
+      status
+    ]
+  );
+
+  return result.rows[0];
+}
+
+/**
+ * Register vendor for checkout
+ */
+async function registerVendor(vendorAddress, vendorData) {
+  const { name, email } = vendorData;
+
+  // Check if vendor already has API key
+  const existing = await pool.query(
+    `SELECT * FROM vendor_api_keys WHERE vendor_address = $1 AND active = true`,
+    [vendorAddress.toLowerCase()]
+  );
+
+  if (existing.rows.length > 0) {
+    return existing.rows[0];
+  }
+
+  // Generate API key
+  const { apiKey, apiSecret } = generateApiKey();
+
+  const result = await pool.query(
+    `INSERT INTO vendor_api_keys 
+     (vendor_address, api_key, api_secret, name)
+     VALUES ($1, $2, $3, $4)
+     RETURNING *`,
+    [vendorAddress.toLowerCase(), apiKey, apiSecret, name || null]
+  );
+
+  return {
+    ...result.rows[0],
+    apiSecret // Only returned on creation
+  };
+}
+
+/**
+ * Verify API key
+ */
+async function verifyApiKey(apiKey) {
+  const result = await pool.query(
+    `SELECT * FROM vendor_api_keys WHERE api_key = $1 AND active = true`,
+    [apiKey]
+  );
+
+  if (result.rows.length === 0) {
+    return null;
+  }
+
+  // Update last used
+  await pool.query(
+    `UPDATE vendor_api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE api_key = $1`,
+    [apiKey]
+  );
+
+  return result.rows[0];
+}
+
+/**
+ * Send webhook to vendor
+ */
+async function sendWebhook(webhookData) {
+  const {
+    vendorAddress,
+    apiKeyId,
+    orderId,
+    eventType,
+    payload
+  } = webhookData;
+
+  // Get webhook URL
+  const apiKeyResult = await pool.query(
+    `SELECT webhook_url FROM vendor_api_keys WHERE id = $1 AND active = true`,
+    [apiKeyId]
+  );
+
+  if (apiKeyResult.rows.length === 0 || !apiKeyResult.rows[0].webhook_url) {
+    console.warn(`[Checkout] No webhook URL configured for vendor ${vendorAddress}`);
+    return null;
+  }
+
+  const webhookUrl = apiKeyResult.rows[0].webhook_url;
+
+  // Record webhook attempt
+  const webhookResult = await pool.query(
+    `INSERT INTO vendor_webhooks 
+     (vendor_address, api_key_id, order_id, event_type, payload, status)
+     VALUES ($1, $2, $3, $4, $5, 'pending')
+     RETURNING *`,
+    [
+      vendorAddress.toLowerCase(),
+      apiKeyId,
+      orderId,
+      eventType,
+      JSON.stringify(payload)
+    ]
+  );
+
+  const webhookId = webhookResult.rows[0].id;
+
+  // Send webhook
+  try {
+    const axios = require('axios');
+    const response = await axios.post(webhookUrl, payload, {
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Webhook-Event': eventType,
+        'X-Webhook-Id': webhookId.toString()
+      },
+      timeout: 10000
+    });
+
+    // Update webhook status
+    await pool.query(
+      `UPDATE vendor_webhooks 
+       SET status = 'delivered',
+           attempts = attempts + 1,
+           last_attempt_at = CURRENT_TIMESTAMP,
+           response_status = $1,
+           response_body = $2
+       WHERE id = $3`,
+      [response.status, JSON.stringify(response.data), webhookId]
+    );
+
+    return { success: true, webhookId, status: response.status };
+  } catch (error) {
+    // Update webhook status
+    await pool.query(
+      `UPDATE vendor_webhooks 
+       SET status = 'failed',
+           attempts = attempts + 1,
+           last_attempt_at = CURRENT_TIMESTAMP,
+           response_body = $1
+       WHERE id = $2`,
+      [error.message, webhookId]
+    );
+
+    console.error(`[Checkout] Webhook failed for order ${orderId}:`, error.message);
+    return { success: false, webhookId, error: error.message };
+  }
+}
+
+/**
+ * Process refund
+ */
+async function processRefund(orderId, vendorAddress) {
+  const order = await getOrder(orderId);
+
+  if (!order) {
+    throw new Error('Order not found');
+  }
+
+  if (order.vendor_address.toLowerCase() !== vendorAddress.toLowerCase()) {
+    throw new Error('Unauthorized');
+  }
+
+  if (order.status !== 'paid') {
+    throw new Error('Order must be paid to refund');
+  }
+
+  // Update order status
+  await updateOrderStatus(orderId, 'refunded');
+
+  // Send webhook
+  const apiKeyResult = await pool.query(
+    `SELECT id FROM vendor_api_keys WHERE vendor_address = $1 AND active = true LIMIT 1`,
+    [vendorAddress.toLowerCase()]
+  );
+
+  if (apiKeyResult.rows.length > 0) {
+    await sendWebhook({
+      vendorAddress,
+      apiKeyId: apiKeyResult.rows[0].id,
+      orderId,
+      eventType: 'order.refunded',
+      payload: {
+        orderId,
+        status: 'refunded',
+        amount: order.total_amount,
+        currency: order.currency
+      }
+    });
+  }
+
+  return order;
+}
+
+module.exports = {
+  createOrder,
+  getOrder,
+  getAllOrders,
+  getCustomerOrders,
+  getVendorOrders,
+  updateOrderStatus,
+  recordTransaction,
+  registerVendor,
+  verifyApiKey,
+  sendWebhook,
+  processRefund,
+  generateOrderId
+};
+
